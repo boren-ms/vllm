@@ -5,9 +5,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef __aarch64__
+  #include <atomic>
+#endif
+
 namespace {
 #define MAX_SHM_RANK_NUM 8
-#define PER_THREAD_SHM_BUFFER_BYTES (2 * 1024 * 1024)
+#define PER_THREAD_SHM_BUFFER_BYTES (4 * 1024 * 1024)
 static_assert(PER_THREAD_SHM_BUFFER_BYTES % 2 == 0);
 #define PER_THREAD_SHM_BUFFER_OFFSET (PER_THREAD_SHM_BUFFER_BYTES >> 1)
 #define MIN_THREAD_PROCESS_SIZE (256)
@@ -34,9 +38,19 @@ struct KernelVecType<c10::Half> {
 };
 
 struct ThreadSHMContext {
-  volatile char _curr_thread_stamp;
-  volatile char _ready_thread_stamp;
-  char _padding1[6];
+#ifdef __aarch64__
+  // memory model is weaker on AArch64, so we use atomic variables for
+  // consumer (load-acquire) and producer (store-release) to make sure
+  // that a stamp cannot be ready before the corresponding data is ready.
+  std::atomic<char> _curr_thread_stamp[2];
+  std::atomic<char> _ready_thread_stamp[2];
+  static_assert(std::atomic<char>::is_always_lock_free);
+#else
+  volatile char _curr_thread_stamp[2];
+  volatile char _ready_thread_stamp[2];
+#endif  // __aarch64__
+  int local_stamp_buffer_idx;
+  int remote_stamp_buffer_idx;
   int thread_id;
   int thread_num;
   int rank;
@@ -45,29 +59,46 @@ struct ThreadSHMContext {
   int swizzled_ranks[MAX_SHM_RANK_NUM];
   void* thread_shm_ptrs[MAX_SHM_RANK_NUM];
   ThreadSHMContext* shm_contexts[MAX_SHM_RANK_NUM];
-  size_t _thread_buffer_mask;
-  char _padding2[56];
+  size_t _thread_buffer_mask[2];
+  char _padding2[40];
 
   ThreadSHMContext(const int thread_id, const int thread_num, const int rank,
                    const int group_size, void* thread_shm_ptr)
-      : _curr_thread_stamp(1),
-        _ready_thread_stamp(0),
+      : local_stamp_buffer_idx(0),
+        remote_stamp_buffer_idx(0),
         thread_id(thread_id),
         thread_num(thread_num),
         rank(rank),
         group_size(group_size),
-        _spinning_count(0),
-        _thread_buffer_mask(0) {
+        _spinning_count(0) {
     static_assert(sizeof(ThreadSHMContext) % 64 == 0);
     TORCH_CHECK(group_size <= MAX_SHM_RANK_NUM);
     TORCH_CHECK((size_t)this % 64 == 0);
     TORCH_CHECK((size_t)thread_shm_ptr % 64 == 0);
+#ifdef __aarch64__
+    _curr_thread_stamp[0].store(1, std::memory_order_relaxed);
+    _curr_thread_stamp[1].store(1, std::memory_order_relaxed);
+    _ready_thread_stamp[0].store(0, std::memory_order_relaxed);
+    _ready_thread_stamp[1].store(0, std::memory_order_relaxed);
+#else
+    _curr_thread_stamp[0] = 1;
+    _curr_thread_stamp[1] = 1;
+    _ready_thread_stamp[0] = 0;
+    _ready_thread_stamp[1] = 0;
+#endif  // __aarch64__
+    _thread_buffer_mask[0] = 0;
+    _thread_buffer_mask[1] = 0;
     for (int i = 0; i < MAX_SHM_RANK_NUM; ++i) {
       shm_contexts[i] = nullptr;
       thread_shm_ptrs[i] = nullptr;
       swizzled_ranks[i] = (i + rank) % group_size;
     }
     set_context(rank, this, thread_shm_ptr);
+  }
+
+  void set_stamp_buffer_idx(int local, int remote) {
+    local_stamp_buffer_idx = local;
+    remote_stamp_buffer_idx = remote;
   }
 
   void set_context(int rank, ThreadSHMContext* ptr, void* thread_shm_ptr) {
@@ -84,23 +115,51 @@ struct ThreadSHMContext {
   T* get_thread_shm_ptr(int rank) {
     return reinterpret_cast<T*>(
         reinterpret_cast<int8_t*>(thread_shm_ptrs[rank]) +
-        (PER_THREAD_SHM_BUFFER_OFFSET & _thread_buffer_mask));
+        (PER_THREAD_SHM_BUFFER_OFFSET &
+         _thread_buffer_mask[local_stamp_buffer_idx]));
   }
 
-  void next_buffer() { _thread_buffer_mask ^= 0xFFFFFFFFFFFFFFFF; }
+  void next_buffer() {
+    _thread_buffer_mask[local_stamp_buffer_idx] ^= 0xFFFFFFFFFFFFFFFF;
+  }
 
-  char get_curr_stamp() const { return _curr_thread_stamp; }
+  char get_curr_stamp(int idx) const {
+#ifdef __aarch64__
+    return _curr_thread_stamp[idx].load(std::memory_order_acquire);
+#else
+    return _curr_thread_stamp[idx];
+#endif  // __aarch64__
+  }
 
-  char get_ready_stamp() const { return _ready_thread_stamp; }
+  char get_ready_stamp(int idx) const {
+#ifdef __aarch64__
+    return _ready_thread_stamp[idx].load(std::memory_order_acquire);
+#else
+    return _ready_thread_stamp[idx];
+#endif  // __aarch64__
+  }
 
   void next_stamp() {
+#ifdef __aarch64__
+    _curr_thread_stamp[local_stamp_buffer_idx].fetch_add(
+        1, std::memory_order_release);
+#else
     _mm_mfence();
-    _curr_thread_stamp += 1;
+    _curr_thread_stamp[local_stamp_buffer_idx] += 1;
+#endif  // __aarch64__
   }
 
   void commit_ready_stamp() {
+#ifdef __aarch64__
+    _ready_thread_stamp[local_stamp_buffer_idx].store(
+        _curr_thread_stamp[local_stamp_buffer_idx].load(
+            std::memory_order_relaxed),
+        std::memory_order_release);
+#else
     _mm_mfence();
-    _ready_thread_stamp = _curr_thread_stamp;
+    _ready_thread_stamp[local_stamp_buffer_idx] =
+        _curr_thread_stamp[local_stamp_buffer_idx];
+#endif  // __aarch64__
   }
 
   int get_swizzled_rank(int idx) { return swizzled_ranks[idx]; }
@@ -117,16 +176,21 @@ struct ThreadSHMContext {
   void wait_for_one(int rank, Cond&& cond) {
     ThreadSHMContext* rank_ctx = shm_contexts[rank];
     for (;;) {
-      char local_curr_stamp = get_curr_stamp();
-      char local_ready_stamp = get_ready_stamp();
-      char rank_curr_stamp = rank_ctx->get_curr_stamp();
-      char rank_ready_stamp = rank_ctx->get_ready_stamp();
+      char local_curr_stamp = get_curr_stamp(local_stamp_buffer_idx);
+      char local_ready_stamp = get_ready_stamp(local_stamp_buffer_idx);
+      char rank_curr_stamp = rank_ctx->get_curr_stamp(remote_stamp_buffer_idx);
+      char rank_ready_stamp =
+          rank_ctx->get_ready_stamp(remote_stamp_buffer_idx);
       if (cond(local_curr_stamp, local_ready_stamp, rank_curr_stamp,
                rank_ready_stamp)) {
         break;
       }
       ++_spinning_count;
+#ifdef __aarch64__
+      __asm__ __volatile__("yield");
+#else
       _mm_pause();
+#endif  // __aarch64__
     }
   }
 
@@ -173,10 +237,10 @@ struct ThreadSHMContext {
 class SHMManager {
  public:
   explicit SHMManager(const std::string& name, const int rank,
-                      const int group_size)
+                      const int group_size, const int thread_num)
       : _rank(rank),
         _group_size(group_size),
-        _thread_num(torch::get_num_threads()),
+        _thread_num(thread_num),
         _shm_names({""}),
         _shared_mem_ptrs({nullptr}),
         _shm_ctx(nullptr) {
@@ -218,11 +282,11 @@ class SHMManager {
   }
 
   static int64_t create_singleton_instance(const std::string& name,
-                                           const int group_size,
-                                           const int rank) {
+                                           const int group_size, const int rank,
+                                           const int thread_num) {
     std::lock_guard<std::mutex> guard(SingletonInstancesLock);
     SingletonInstances.emplace_back(
-        std::make_unique<SHMManager>(name, rank, group_size));
+        std::make_unique<SHMManager>(name, rank, group_size, thread_num));
     return static_cast<int64_t>(SingletonInstances.size() - 1);
   }
 
@@ -359,6 +423,15 @@ void shm_cc_loop(ThreadSHMContext* ctx, int64_t elem_num, F&& inner_func) {
       offset += max_per_thread_iteration_elem_num;
       curr_elem_num = std::min(max_per_thread_iteration_elem_num, end - offset);
     }
+  }
+}
+
+void reset_threads_stamp_buffer_idx(ThreadSHMContext* ctx, int local,
+                                    int remote) {
+  int thread_num = ctx->thread_num;
+  for (int i = 0; i < thread_num; ++i) {
+    ThreadSHMContext* thread_ctx = ctx + i;
+    thread_ctx->set_stamp_buffer_idx(local, remote);
   }
 }
 };  // namespace shm_cc_ops
@@ -632,6 +705,7 @@ void shm_send_tensor_list_impl(ThreadSHMContext* ctx, int64_t dst,
   TensorListMeta* metadata = new (metadata_tensor.data_ptr()) TensorListMeta();
   metadata->bind_tensor_list(tensor_list_with_metadata);
 
+  shm_cc_ops::reset_threads_stamp_buffer_idx(ctx, 0, 1);
   shm_cc_ops::shm_cc_loop<int8_t>(
       ctx, metadata->total_bytes,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
@@ -659,6 +733,7 @@ std::vector<torch::Tensor> shm_recv_tensor_list_impl(ThreadSHMContext* ctx,
   torch::Tensor metadata_tensor =
       torch::empty({sizeof(TensorListMeta)}, options);
 
+  shm_cc_ops::reset_threads_stamp_buffer_idx(ctx, 1, 0);
   ctx->wait_for_one(src, ThreadSHMContext::check_stamp_ready);
   shm_cc_ops::memcpy(metadata_tensor.data_ptr(),
                      ctx->get_thread_shm_ptr<void>(src),
@@ -677,7 +752,7 @@ std::vector<torch::Tensor> shm_recv_tensor_list_impl(ThreadSHMContext* ctx,
       ctx, metadata.total_bytes,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
-        ctx->wait_for_one(src, ThreadSHMContext::check_stamp_ready);
+        thread_ctx->wait_for_one(src, ThreadSHMContext::check_stamp_ready);
         int64_t curr_shm_offset = 0;
         while (curr_shm_offset < data_elem_num) {
           MemPiece frag = metadata.get_data(data_offset + curr_shm_offset);
@@ -779,8 +854,9 @@ std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src) {
 }
 
 int64_t init_shm_manager(const std::string& name, const int64_t group_size,
-                         const int64_t rank) {
-  return SHMManager::create_singleton_instance(name, group_size, rank);
+                         const int64_t rank, const int64_t thread_num) {
+  return SHMManager::create_singleton_instance(name, group_size, rank,
+                                               thread_num);
 }
 
 std::string join_shm_manager(int64_t handle, const std::string& name) {

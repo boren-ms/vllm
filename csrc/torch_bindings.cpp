@@ -2,7 +2,6 @@
 #include "cuda_utils.h"
 #include "ops.h"
 #include "core/registration.h"
-
 #include <torch/library.h>
 #include <torch/version.h>
 
@@ -20,17 +19,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
   //
 
-  // The default behavior in PyTorch 2.6 was changed to "requires_contiguous",
-  // so we need
-  // to override this for many GEMMs with the following tag. Otherwise,
-  // torch.compile will force all input tensors to be contiguous(), which
-  // will break many custom ops that require column-major weight matrices.
-  // This was a bug and PyTorch 2.7 has since fixed this.
-#if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 6
-  #define stride_tag at::Tag::needs_fixed_stride_order
-#else
-  #define stride_tag
-#endif
+  ops.def(
+      "persistent_masked_m_silu_mul_quant(Tensor input, Tensor counts, Tensor! "
+      "y_q, Tensor! y_s,"
+      "bool use_ue8m0) -> ()");
+  ops.impl("persistent_masked_m_silu_mul_quant", torch::kCUDA,
+           &persistent_masked_m_silu_mul_quant);
 
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
@@ -68,7 +62,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    int blocksparse_head_sliding_step) -> ()");
   ops.impl("paged_attention_v2", torch::kCUDA, &paged_attention_v2);
 
-#ifndef USE_ROCM
   // Merge attn states
   // Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
   // can be used to combine partial attention results (in the split-KV case)
@@ -79,9 +72,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor prefix_output,"
       "    Tensor prefix_lse,"
       "    Tensor suffix_output,"
-      "    Tensor suffix_lse) -> ()");
+      "    Tensor suffix_lse,"
+      "    int!? prefill_tokens_with_context,"
+      "    Tensor? output_scale=None) -> ()");
   ops.impl("merge_attn_states", torch::kCUDA, &merge_attn_states);
-
+#ifndef USE_ROCM
   ops.def(
       "convert_vertical_slash_indexes("
       "   Tensor! block_count, Tensor! block_offset, "
@@ -111,9 +106,27 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
+  // SwiGLU activation with input clamping.
+  ops.def(
+      "silu_and_mul_with_clamp(Tensor! result, Tensor input, float limit) "
+      "-> ()");
+  ops.impl("silu_and_mul_with_clamp", torch::kCUDA, &silu_and_mul_clamp);
+
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
   ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);
+
+  // Fused SiLU+Mul + per-block quantization
+  ops.def(
+      "silu_and_mul_per_block_quant("
+      "Tensor! out, "
+      "Tensor input, "
+      "Tensor! scales, "
+      "int group_size, "
+      "Tensor? scale_ub=None, "
+      "bool is_scale_transposed=False) -> ()");
+  ops.impl("silu_and_mul_per_block_quant", torch::kCUDA,
+           &silu_and_mul_per_block_quant);
 
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
   ops.impl("mul_and_silu", torch::kCUDA, &mul_and_silu);
@@ -130,6 +143,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("fatrelu_and_mul(Tensor! out, Tensor input, float threshold) -> ()");
   ops.impl("fatrelu_and_mul", torch::kCUDA, &fatrelu_and_mul);
 
+  ops.def(
+      "swigluoai_and_mul(Tensor! out, Tensor input, float alpha=1.702, float "
+      "limit=7.0) "
+      "-> ()");
+  ops.impl("swigluoai_and_mul", torch::kCUDA, &swigluoai_and_mul);
+
   // GELU implementation used in GPT-2.
   ops.def("gelu_new(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_new", torch::kCUDA, &gelu_new);
@@ -141,25 +160,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // Quick GELU implementation.
   ops.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_quick", torch::kCUDA, &gelu_quick);
-
-  // prepare_inputs advance_step
-  ops.def(
-      "advance_step_flashattn(int num_seqs, int num_queries, int block_size, "
-      "Tensor! input_tokens, Tensor sampled_token_ids, "
-      "Tensor! input_positions, Tensor! seq_lens, Tensor! slot_mapping, "
-      "Tensor block_tables) -> ()");
-  ops.impl("advance_step_flashattn", torch::kCUDA, &advance_step_flashattn);
-
-  ops.def(
-      "advance_step_flashinfer("
-      "    int num_seqs, int num_queries, int block_size,"
-      "    Tensor! input_tokens, Tensor sampled_token_ids,"
-      "    Tensor! input_positions, Tensor! seq_lens, Tensor! slot_mapping,"
-      "    Tensor block_tables, Tensor! paged_kv_indices,"
-      "    Tensor! paged_kv_indptr, Tensor! paged_kv_last_page_len,"
-      "    Tensor! block_table_bounds"
-      ") -> ()");
-  ops.impl("advance_step_flashinfer", torch::kCUDA, &advance_step_flashinfer);
 
   // Layernorm
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
@@ -174,12 +174,50 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "float epsilon) -> ()");
   ops.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
 
+  // Function for fused QK Norm and RoPE
+  ops.def(
+      "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
+      "int num_heads_k, int num_heads_v, int head_dim, float eps, "
+      "Tensor q_weight, Tensor k_weight, Tensor cos_sin_cache, "
+      "bool is_neox, Tensor position_ids, "
+      "int forced_token_heads_per_warp=-1) -> ()");
+  ops.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
+
+  // Horizontally-fused DeepseekV4-MLA: per-head RMSNorm + GPT-J RoPE for Q, and
+  // GPT-J RoPE + UE8M0 FP8 quant + paged cache insert for KV, all in one
+  // kernel launch.
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
+      "Tensor! q, Tensor kv, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+      "float eps, int cache_block_size) -> ()");
+  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert", torch::kCUDA,
+           &fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert);
+
   // Apply repetition penalties to logits in-place
   ops.def(
       "apply_repetition_penalties_(Tensor! logits, Tensor prompt_mask, "
       "Tensor output_mask, Tensor repetition_penalties) -> ()");
   ops.impl("apply_repetition_penalties_", torch::kCUDA,
            &apply_repetition_penalties_);
+
+  // Optimized top-k per row operation
+  ops.def(
+      "top_k_per_row_prefill(Tensor logits, Tensor rowStarts, Tensor rowEnds, "
+      "Tensor! indices, int numRows, int stride0, "
+      "int stride1, int topK) -> ()");
+  ops.impl("top_k_per_row_prefill", torch::kCUDA, &top_k_per_row_prefill);
+
+  ops.def(
+      "top_k_per_row_decode(Tensor logits, int next_n, "
+      "Tensor seq_lens, Tensor! indices, "
+      "int numRows, int stride0, int stride1, int topK) -> ()");
+  ops.impl("top_k_per_row_decode", torch::kCUDA, &top_k_per_row_decode);
+
+  ops.def(
+      "persistent_topk(Tensor logits, Tensor lengths, Tensor! output, "
+      "Tensor workspace, int k, int max_seq_len) -> ()");
+  ops.impl("persistent_topk", torch::kCUDA, &persistent_topk);
 
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
@@ -206,53 +244,40 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("rms_norm_dynamic_per_token_quant", torch::kCUDA,
            &rms_norm_dynamic_per_token_quant);
 
+  // Fused Layernorm + Block quant kernels
+  ops.def(
+      "rms_norm_per_block_quant(Tensor! result, Tensor input, "
+      "Tensor weight, Tensor! scale, float epsilon, "
+      "Tensor? scale_ub, Tensor!? residual, int group_size, "
+      "bool is_scale_transposed) -> ()");
+  ops.impl("rms_norm_per_block_quant", torch::kCUDA, &rms_norm_per_block_quant);
+
   // Rotary embedding
   // Apply GPT-NeoX or GPT-J style rotary embedding to query and key.
   ops.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
-      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+      "                 Tensor cos_sin_cache, bool is_neox, int "
+      "rope_dim_offset=0, bool inverse=False) -> ()");
   ops.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
-
-  // Apply GPT-NeoX or GPT-J style rotary embedding to query and key
-  // (supports multiple loras).
-  ops.def(
-      "batched_rotary_embedding(Tensor positions, Tensor! query,"
-      "                         Tensor!? key, int head_size,"
-      "                         Tensor cos_sin_cache, bool is_neox,"
-      "                         int rot_dim,"
-      "                         Tensor cos_sin_cache_offsets) -> ()");
-  ops.impl("batched_rotary_embedding", torch::kCUDA, &batched_rotary_embedding);
 
   // Quantization ops
 #ifndef USE_ROCM
-  // Quantized GEMM for AQLM.
+  // DeepSeek V3 fused A GEMM (SM 9.0+, bf16 only, 1-16 tokens).
   ops.def(
-      "aqlm_gemm(Tensor input, Tensor codes, Tensor codebooks, "
-      "Tensor scales, int[] codebook_partition_sizes, Tensor? bias) "
-      "-> Tensor",
-      {stride_tag});
-  ops.impl("aqlm_gemm", torch::kCUDA, &aqlm_gemm);
-
-  // Decompression method for AQLM.
-  ops.def(
-      "aqlm_dequant(Tensor codes, Tensor codebooks, "
-      "int[] codebook_partition_sizes) -> Tensor",
-      {stride_tag});
-  ops.impl("aqlm_dequant", torch::kCUDA, &aqlm_dequant);
+      "dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  // conditionally compiled so impl registration is in source file
 
   // Quantized GEMM for AWQ.
   ops.def(
       "awq_gemm(Tensor _in_feats, Tensor _kernel, Tensor _scaling_factors, "
-      "Tensor _zeros, SymInt split_k_iters) -> Tensor",
-      {stride_tag});
+      "Tensor _zeros, SymInt split_k_iters) -> Tensor");
   ops.impl("awq_gemm", torch::kCUDA, &awq_gemm);
 
   // Dequantization for AWQ.
   ops.def(
       "awq_dequantize(Tensor _kernel, Tensor _scaling_factors, "
-      "Tensor _zeros, SymInt split_k_iters, int thx, int thy) -> Tensor",
-      {stride_tag});
+      "Tensor _zeros, SymInt split_k_iters, int thx, int thy) -> Tensor");
   ops.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
 
   // Note about marlin kernel 'workspace' arguments:
@@ -268,23 +293,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // See the following document for more info on custom types and ops that use
   // custom types:
   // https://docs.google.com/document/d/18fBMPuOJ0fY5ZQ6YyrHUppw9FA332CpNtgB6SOIgyuA
-
-  // Marlin (Dense) Optimized Quantized GEMM for GPTQ.
-  ops.def(
-      "marlin_gemm(Tensor a, Tensor b_q_weight, Tensor b_scales, "
-      "Tensor! workspace, SymInt size_m, SymInt size_n, SymInt size_k) -> "
-      "Tensor",
-      {stride_tag});
-  // conditionally compiled so impl in source file
-
-  // Marlin_24 (Sparse) Optimized Quantized GEMM for GPTQ.
-  ops.def(
-      "gptq_marlin_24_gemm(Tensor a, Tensor b_q_weight, Tensor b_meta, "
-      "Tensor b_scales, Tensor workspace, "
-      "int b_q_type, "
-      "SymInt size_m, SymInt size_n, SymInt size_k) -> Tensor",
-      {stride_tag});
-  //  conditionally compiled so impl in source file
 
   // Machete (Dense) Optimized Mixed Precision GEMM for Hopper.
   ops.def(
@@ -309,8 +317,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "   Tensor? channel_scales,"
       "   Tensor? token_scales,"
       "   str?    schedule"
-      ") -> Tensor",
-      {stride_tag});
+      ") -> Tensor");
   ops.def(
       "machete_prepack_B("
       "   Tensor B,"
@@ -320,30 +327,35 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       ") -> Tensor");
   // conditionally compiled so impl registration is in source file
 
-  ops.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
-  ops.impl("permute_cols", torch::kCUDA, &permute_cols);
-
-  // gptq_marlin Optimized Quantized GEMM for GPTQ.
+  // Marlin Optimized Quantized GEMM (supports GPTQ, AWQ, FP8, NVFP4, MXFP4).
   ops.def(
-      "gptq_marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
-      "Tensor b_scales, Tensor? global_scale, Tensor? b_zeros_or_none, Tensor? "
-      "g_idx_or_none, Tensor? perm_or_none, Tensor workspace, int b_q_type, "
+      "marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
+      "Tensor? b_bias_or_none,Tensor b_scales, "
+      "Tensor? a_scales, Tensor? global_scale, Tensor? b_zeros_or_none, "
+      "Tensor? "
+      "g_idx_or_none, Tensor? perm_or_none, Tensor workspace, int b_type_id, "
       "SymInt size_m, SymInt size_n, SymInt size_k, bool is_k_full, "
-      "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor",
-      {stride_tag});
+      "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
   // conditionally compiled so impl registration is in source file
 
   // gptq_marlin repack from GPTQ.
   ops.def(
       "gptq_marlin_repack(Tensor b_q_weight, Tensor perm, "
-      "SymInt size_k, SymInt size_n, int num_bits) -> Tensor");
+      "SymInt size_k, SymInt size_n, int num_bits, bool is_a_8bit) -> Tensor");
   // conditionally compiled so impl registrations are in source file
 
   // awq_marlin repack from AWQ.
   ops.def(
       "awq_marlin_repack(Tensor b_q_weight, SymInt size_k, "
-      "SymInt size_n, int num_bits) -> Tensor");
+      "SymInt size_n, int num_bits, bool is_a_8bit) -> Tensor");
   // conditionally compiled so impl registrations are in source file
+
+  // preprocess W-int4A-fp8 weight for marlin kernel
+  ops.def(
+      "marlin_int4_fp8_preprocess(Tensor qweight, "
+      "Tensor? qzeros_or_none, bool inplace) -> Tensor");
+  // conditionally compiled so impl registrations are in source file
+
 #endif
 
   // Dequantization for GGML.
@@ -380,150 +392,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
 #ifndef USE_ROCM
-  // marlin_qqq_gemm for QQQ.
+  // Expert-specialization mxfp8 blockscaled grouped quantization (SM100+).
   ops.def(
-      "marlin_qqq_gemm(Tensor a, Tensor b_q_weight, "
-      "Tensor s_tok, Tensor s_ch, Tensor s_group, "
-      "Tensor! workspace, SymInt size_m, SymInt size_n, "
-      "SymInt size_k) -> Tensor",
-      {stride_tag});
+      "mxfp8_experts_quant("
+      " Tensor input, Tensor problem_sizes, Tensor expert_offsets,"
+      " Tensor blockscale_offsets, Tensor! quant_output, Tensor! scale_factor)"
+      " -> ()");
   // conditionally compiled so impl registration is in source file
 
-  // CUTLASS nvfp4 block scaled GEMM
+  // Expert-specialization mxfp8 blockscaled grouped GEMM (SM100+).
   ops.def(
-      "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
-      "                      Tensor block_scale_a, Tensor block_scale_b,"
-      "                      Tensor alpha) -> ()",
-      {stride_tag});
-  ops.impl("cutlass_scaled_fp4_mm", torch::kCUDA, &cutlass_scaled_fp4_mm);
-
-  // cutlass blockwise scaledgroup GEMM
-  ops.def(
-      "cutlass_blockwise_scaled_grouped_mm(Tensor! output, Tensor a, Tensor b, "
-      "Tensor scales_a, Tensor scales_b, "
-      "Tensor problem_sizes, Tensor expert_offsets) -> ()",
-      {stride_tag});
+      "cutlass_mxfp8_grouped_mm("
+      " Tensor a, Tensor b, Tensor sfa, Tensor sfb, Tensor! out,"
+      " Tensor problem_sizes, Tensor expert_offsets, Tensor blockscale_offsets)"
+      " -> ()");
   // conditionally compiled so impl registration is in source file
-
-  // cutlass nvfp4 block scaled group GEMM
-  ops.def(
-      "cutlass_fp4_group_mm(Tensor! out, Tensor a, Tensor b,"
-      " Tensor a_blockscale, Tensor b_blockscales, Tensor alphas,"
-      " Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets) -> ()",
-      {stride_tag});
-  ops.impl("cutlass_fp4_group_mm", torch::kCUDA, &cutlass_fp4_group_mm);
-
-  // CUTLASS w8a8 GEMM, supporting symmetric per-tensor or per-row/column
-  // quantization, as well as bias
-  ops.def(
-      "cutlass_scaled_mm(Tensor! out, Tensor a,"
-      "                  Tensor b, Tensor a_scales,"
-      "                  Tensor b_scales, Tensor? bias) -> ()",
-      {stride_tag});
-  ops.impl("cutlass_scaled_mm", torch::kCUDA, &cutlass_scaled_mm);
-
-  // CUTLASS w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
-  // quantization.
-  ops.def(
-      "cutlass_scaled_mm_azp(Tensor! out, Tensor a,"
-      "                  Tensor b, Tensor a_scales,"
-      "                  Tensor b_scales, Tensor azp_adj,"
-      "                  Tensor? azp, Tensor? bias) -> ()",
-      {stride_tag});
-  ops.impl("cutlass_scaled_mm_azp", torch::kCUDA, &cutlass_scaled_mm_azp);
-
-  // Check if cutlass scaled_mm is supported for CUDA devices of the given
-  // capability
-  ops.def("cutlass_scaled_mm_supports_fp8(int cuda_device_capability) -> bool");
-  ops.impl("cutlass_scaled_mm_supports_fp8", &cutlass_scaled_mm_supports_fp8);
-
-  // Check if cutlass grouped gemm is supported for CUDA devices of the given
-  // capability
-  ops.def("cutlass_group_gemm_supported(int cuda_device_capability) -> bool");
-  ops.impl("cutlass_group_gemm_supported", &cutlass_group_gemm_supported);
-
-  // CUTLASS w8a8 grouped GEMM
-  ops.def(
-      "cutlass_moe_mm(Tensor! out_tensors, Tensor a_tensors, Tensor b_tensors, "
-      "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
-      "               Tensor problem_sizes, Tensor a_strides, "
-      "               Tensor b_strides, Tensor c_strides, bool per_act_token, "
-      "               bool per_out_ch) -> ()",
-      {stride_tag});
-  ops.impl("cutlass_moe_mm", torch::kCUDA, &cutlass_moe_mm);
-
-  // A function that computes data required to run fused MoE with w8a8 grouped
-  // GEMM. It takes topk_ids as an input, and computes expert_offsets
-  // (token start indices of each expert). In addition to this, it computes
-  // problem sizes for each expert's multiplication used by the two mms called
-  // from fused MoE operation, and arrays with permutations required to shuffle
-  // and de-shuffle the input/output of the fused operation.
-  ops.def(
-      "get_cutlass_moe_mm_data(Tensor topk_ids, Tensor! expert_offsets, "
-      "                        Tensor! problem_sizes1, Tensor! problem_sizes2, "
-      "                        Tensor! input_permutation, "
-      "                        Tensor! output_permutation, int num_experts, "
-      "                        int n, int k, Tensor? blockscale_offsets) -> ()",
-      {stride_tag});
-  ops.impl("get_cutlass_moe_mm_data", torch::kCUDA, &get_cutlass_moe_mm_data);
-
-  // A function that computes data required to run fused MoE with w8a8 grouped
-  // GEMM and PPLX. It takes expert_num_tokens and non_zero_expert_idxs
-  // as an input, and computes expert_offsets (token start indices of each
-  // expert). In addition to this, it computes problem sizes for each expert's
-  // multiplication used by the two mms called from fused MoE operation.
-  ops.def(
-      "get_cutlass_pplx_moe_mm_data(Tensor! expert_offsets, "
-      "                             Tensor! problem_sizes1, "
-      "                             Tensor! problem_sizes2, "
-      "                             Tensor expert_num_tokens, "
-      "                             int num_local_experts, int padded_m, "
-      "                             int n, int k) -> ()",
-      {stride_tag});
-  ops.impl("get_cutlass_pplx_moe_mm_data", torch::kCUDA,
-           &get_cutlass_pplx_moe_mm_data);
-
-  // Check if cutlass scaled_mm supports block quantization (used by DeepSeekV3)
-  ops.def(
-      "cutlass_scaled_mm_supports_block_fp8(int cuda_device_capability) -> "
-      "bool");
-  ops.impl("cutlass_scaled_mm_supports_block_fp8",
-           &cutlass_scaled_mm_supports_block_fp8);
-
-  // Check if cutlass sparse scaled_mm is supported for CUDA devices of the
-  // given capability
-  ops.def(
-      "cutlass_sparse_scaled_mm_supported(int cuda_device_capability) -> bool");
-  ops.impl("cutlass_sparse_scaled_mm_supported",
-           &cutlass_sparse_scaled_mm_supported);
-
-  // CUTLASS sparse GEMM, supporting symmetric per-tensor or per-row/column
-  // quantization, as well as bias
-  ops.def(
-      "cutlass_scaled_sparse_mm(Tensor! out, Tensor a,"
-      "                         Tensor bt_nzs,"
-      "                         Tensor bt_meta, Tensor a_scales,"
-      "                         Tensor b_scales, Tensor? bias) -> ()",
-      {stride_tag});
-  ops.impl("cutlass_scaled_sparse_mm", torch::kCUDA, &cutlass_scaled_sparse_mm);
-
-  // CUTLASS sparse matrix compressor
-  ops.def("cutlass_sparse_compress(Tensor a) -> Tensor[]");
-  ops.impl("cutlass_sparse_compress", &cutlass_sparse_compress);
-
-  // CUTLASS MLA decode
-  ops.def(
-      "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe,"
-      "                   Tensor kv_c_and_k_pe_cache, Tensor seq_lens,"
-      "                   Tensor page_table, float scale) -> ()");
-  ops.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
 
   // SM100 CUTLASS MLA decode
   ops.def(
-      "sm100_cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe,"
-      "                         Tensor kv_c_and_k_pe_cache, Tensor seq_lens,"
-      "                         Tensor page_table, Tensor workspace, float "
-      "scale,"
+      "sm100_cutlass_mla_decode(Tensor! out, Tensor! lse, Tensor q_nope,"
+      "                         Tensor q_pe, Tensor kv_c_and_k_pe_cache,"
+      "                         Tensor seq_lens, Tensor page_table,"
+      "                         Tensor workspace, float scale,"
       "                         int num_kv_splits) -> ()");
   // conditionally compiled so impl in source file
 
@@ -534,23 +424,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> int");
   // conditionally compiled so impl in source file
 
-  // Compute NVFP4 block quantized tensor.
-  ops.def(
-      "scaled_fp4_quant(Tensor! output, Tensor input,"
-      "                 Tensor! output_scale, Tensor input_scale) -> ()");
-  ops.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
-
-  // Compute NVFP4 experts quantization.
-  ops.def(
-      "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
-      "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
-      "Tensor output_scale_offset_by_experts) -> ()");
-  ops.impl("scaled_fp4_experts_quant", torch::kCUDA, &scaled_fp4_experts_quant);
-
-  // Check if cutlass_scaled_mm_fp4 is supported for CUDA devices
-  // of the given capability
-  ops.def("cutlass_scaled_mm_supports_fp4(int cuda_device_capability) -> bool");
-  ops.impl("cutlass_scaled_mm_supports_fp4", &cutlass_scaled_mm_supports_fp4);
 #endif
 
   // Quantized GEMM for GPTQ.
@@ -558,9 +431,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // to prevent the meta function registry.
   ops.def(
       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, "
-      "Tensor b_gptq_scales, Tensor b_g_idx, bool use_exllama, int bit) "
-      "-> Tensor",
-      {stride_tag});
+      "Tensor b_gptq_scales, Tensor b_g_idx, bool use_exllama, bool "
+      "use_v2_format, int bit) "
+      "-> Tensor");
   ops.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
 
   // Post processing for GPTQ.
@@ -568,9 +441,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
   // Compute FP8 quantized tensor for given scaling factor.
+  // Supports per-tensor, per-channel, per-token, and arbitrary 2D group
+  // scaling. Optional group_m/group_n specify the group shape explicitly;
+  // required for 1D scales to disambiguate per-channel vs per-token.
   ops.def(
-      "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale) -> "
-      "()");
+      "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale, "
+      "(int, int)? group_shape=None) -> ()");
   ops.impl("static_scaled_fp8_quant", torch::kCUDA, &static_scaled_fp8_quant);
 
   // Compute dynamic-per-tensor FP8 quantized tensor and scaling factor.
@@ -611,8 +487,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? cache_indices,"
       "Tensor? has_initial_state,"
       "Tensor! ssm_states,"
-      "int pad_slot_id) -> ()");
+      "int null_block_id,"
+      "int block_size,"
+      "Tensor? block_idx_first_scheduled_token,"
+      "Tensor? block_idx_last_scheduled_token,"
+      "Tensor? initial_state_idx,"
+      "Tensor? cu_chunk_seqlen,"
+      "Tensor? last_chunk_indices) -> ()");
   ops.impl("selective_scan_fwd", torch::kCUDA, &selective_scan_fwd);
+
+  // Hadamard transforms
+  ops.def("hadacore_transform(Tensor! x, bool inplace) -> Tensor");
 
 #ifndef USE_ROCM
   // reorder weight for AllSpark Ampere W8A16 Fused Gemm kernel
@@ -630,6 +515,29 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? b_qzeros, "
       "SymInt n, SymInt group_size, SymInt sm_count, SymInt sm_version, SymInt "
       "CUBLAS_M_THRESHOLD, bool has_zp, bool n32k16_reorder) -> Tensor");
+
+  ops.def(
+      "minimax_allreduce_rms("
+      "Tensor input,"
+      "Tensor norm_weight,"
+      "Tensor workspace,"
+      "int rank,"
+      "int nranks,"
+      "float eps) -> Tensor");
+  ops.impl("minimax_allreduce_rms", torch::kCUDA, &minimax_allreduce_rms);
+  ops.def(
+      "minimax_allreduce_rms_qk("
+      "Tensor qkv,"
+      "Tensor norm_weight_q,"
+      "Tensor norm_weight_k,"
+      "Tensor workspace,"
+      "int q_size,"
+      "int kv_size,"
+      "int rank,"
+      "int nranks,"
+      "float eps) -> (Tensor, Tensor)");
+  ops.impl("minimax_allreduce_rms_qk", torch::kCUDA, &minimax_allreduce_rms_qk);
+
   //  conditionally compiled so impl in source file
 #endif
 }
@@ -638,18 +546,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   // Cache ops
   // Swap in (out) the cache blocks from src to dst.
   cache_ops.def(
-      "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");
+      "swap_blocks(Tensor src, Tensor! dst,"
+      "            int block_size_in_bytes, Tensor block_mapping) -> ()");
   cache_ops.impl("swap_blocks", torch::kCUDA, &swap_blocks);
 
-  // Copy the cache blocks from src to dst.
+  // Batch swap: submit all block copies in a single driver call.
   cache_ops.def(
-      "copy_blocks(Tensor(a!)[] key_caches, Tensor[](b!) value_caches, "
-      "Tensor block_mapping) -> ()");
-  cache_ops.impl("copy_blocks", torch::kCUDA, &copy_blocks);
-
-  cache_ops.def(
-      "copy_blocks_mla(Tensor(a!)[] kv_caches, Tensor block_mapping) -> ()");
-  cache_ops.impl("copy_blocks_mla", torch::kCUDA, &copy_blocks_mla);
+      "swap_blocks_batch(Tensor src_ptrs, Tensor dst_ptrs,"
+      "                  Tensor sizes,"
+      "                  bool is_src_access_order_any=False) -> ()");
+  cache_ops.impl("swap_blocks_batch", torch::kCPU, &swap_blocks_batch);
 
   // Reshape the key and value tensors and cache them.
   cache_ops.def(
@@ -680,17 +586,68 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                     Tensor scale) -> ()");
   cache_ops.impl("concat_and_cache_mla", torch::kCUDA, &concat_and_cache_mla);
 
+  // Rotate Q and K, then write to kv cache for MLA
+  cache_ops.def(
+      "concat_and_cache_mla_rope_fused("
+      "                     Tensor positions,"
+      "                     Tensor! q_pe,"
+      "                     Tensor! k_pe,"
+      "                     Tensor kv_c,"
+      "                     Tensor cos_sin_cache,"
+      "                     bool is_neox,"
+      "                     Tensor slot_mapping,"
+      "                     Tensor! kv_cache,"
+      "                     str kv_cache_dtype,"
+      "                     Tensor kv_cache_scale) -> ()");
+  cache_ops.impl("concat_and_cache_mla_rope_fused", torch::kCUDA,
+                 &concat_and_cache_mla_rope_fused);
+
   // Convert the key and value cache to fp8 data type.
   cache_ops.def(
       "convert_fp8(Tensor! dst_cache, Tensor src_cache, float scale, "
       "str kv_cache_dtype) -> ()");
   cache_ops.impl("convert_fp8", torch::kCUDA, &convert_fp8);
 
-  // Gather cache blocks from src_cache to dst.
+  // Gather cache blocks from src_cache to dst, dequantizing from
+  // src_cache's dtype to dst's dtype if necessary.
   cache_ops.def(
-      "gather_cache(Tensor src_cache, Tensor! dst, Tensor block_table, "
+      "gather_and_maybe_dequant_cache(Tensor src_cache, Tensor! dst, "
+      "                               Tensor block_table, Tensor cu_seq_lens, "
+      "                               Tensor token_to_seq, "
+      "                               int num_tokens, "
+      "                               str kv_cache_dtype, "
+      "                               Tensor scale, Tensor? seq_starts) -> ()");
+  cache_ops.impl("gather_and_maybe_dequant_cache", torch::kCUDA,
+                 &gather_and_maybe_dequant_cache);
+
+  cache_ops.def(
+      "cp_gather_cache(Tensor src_cache, Tensor! dst, Tensor block_table, "
       "Tensor cu_seq_lens, int batch_size, Tensor? seq_starts) -> ()");
-  cache_ops.impl("gather_cache", torch::kCUDA, &gather_cache);
+  cache_ops.impl("cp_gather_cache", torch::kCUDA, &cp_gather_cache);
+
+  cache_ops.def(
+      "cp_gather_and_upconvert_fp8_kv_cache(Tensor src_cache, Tensor! dst, "
+      "Tensor block_table, Tensor seq_lens, Tensor workspace_starts, int "
+      "batch_size) -> ()");
+  cache_ops.impl("cp_gather_and_upconvert_fp8_kv_cache", torch::kCUDA,
+                 &cp_gather_and_upconvert_fp8_kv_cache);
+
+  cache_ops.def(
+      "indexer_k_quant_and_cache(Tensor k, Tensor! kv_cache, Tensor "
+      "slot_mapping, "
+      "int quant_block_size, str kv_cache_dtype) -> ()");
+  cache_ops.impl("indexer_k_quant_and_cache", torch::kCUDA,
+                 &indexer_k_quant_and_cache);
+
+  cache_ops.def(
+      "concat_mla_q(Tensor ql_nope, Tensor q_pe, Tensor! q_out) -> ()");
+  cache_ops.impl("concat_mla_q", torch::kCUDA, &concat_mla_q);
+
+  cache_ops.def(
+      "cp_gather_indexer_k_quant_cache(Tensor kv_cache, Tensor! dst_k, Tensor! "
+      "dst_scale, Tensor block_table, Tensor cu_seq_lens) -> ()");
+  cache_ops.impl("cp_gather_indexer_k_quant_cache", torch::kCUDA,
+                 &cp_gather_indexer_k_quant_cache);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
